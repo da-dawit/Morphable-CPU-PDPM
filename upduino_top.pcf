@@ -1,0 +1,9 @@
+# UPduino 3.1 Pin Constraints for Morphable CPU
+
+# UART TX - connect to USB-Serial adapter RX
+set_io uart_tx   9
+
+# RGB LED pins
+set_io led_red   39
+set_io led_green 40
+set_io led_blue  41

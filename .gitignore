@@ -1,0 +1,4 @@
+*.vcd
+*.wlf
+*.log
+__pycache__/

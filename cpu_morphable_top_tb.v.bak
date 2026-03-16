@@ -1,0 +1,582 @@
+`timescale 1ns/1ps
+
+
+// MORPHABLE CPU - HYBRID AI PREDICTOR
+
+// The predictor learns to select:
+//   1. Pipeline mode (P3, P5, P7)
+//   2. Optimal clock multiplier WITHIN that mode's physical range
+//
+// Physical Constraints (since deeper pipelines allow for faster clk freq.)
+//   P3: Can choose from 1.0x, 1.1x
+//   P5: Can choose from 1.0x, 1.1x, 1.2x, 1.3x
+//   P7: Can choose from 1.0x, 1.1x, 1.2x, 1.3x, 1.4x, 1.5x
+//
+// The AI learns which clock speed is optimal for each workload pattern!
+
+
+`define SIMULATION
+
+module cpu_morphable_top_tb;
+
+    reg clk;
+    reg reset;
+    reg [1:0] mode_select;
+    reg mode_switch_req;
+    reg auto_mode_enable;
+
+    wire [1:0] current_mode;
+    wire mode_switching;
+    wire [31:0] debug_pc;
+    wire [31:0] debug_inst;
+    wire        debug_reg_write;
+    wire [4:0]  debug_rd;
+    wire [31:0] debug_rd_data;
+    wire [31:0] cycle_count;
+    wire [31:0] inst_count;
+    wire [31:0] stall_count;
+    wire [31:0] flush_count;
+    wire [1:0]  predicted_mode;
+    wire [7:0]  prediction_confidence;
+
+    cpu_morphable_top dut (
+        .clk(clk),
+        .reset(reset),
+        .mode_select(mode_select),
+        .mode_switch_req(mode_switch_req),
+        .auto_mode_enable(auto_mode_enable),
+        .current_mode(current_mode),
+        .mode_switching(mode_switching),
+        .debug_pc(debug_pc),
+        .debug_inst(debug_inst),
+        .debug_reg_write(debug_reg_write),
+        .debug_rd(debug_rd),
+        .debug_rd_data(debug_rd_data),
+        .cycle_count(cycle_count),
+        .inst_count(inst_count),
+        .stall_count(stall_count),
+        .flush_count(flush_count),
+        .predicted_mode(predicted_mode),
+        .prediction_confidence(prediction_confidence)
+    );
+
+    initial clk = 0;
+    always #5 clk = ~clk;
+
+    
+    // RESULTS STORAGE - Test ALL (mode, clock) combinations
+    
+    // P3: 2 clock options (1.0x, 1.1x)
+    // P5: 4 clock options (1.0x, 1.1x, 1.2x, 1.3x)
+    // P7: 6 clock options (1.0x, 1.1x, 1.2x, 1.3x, 1.4x, 1.5x)
+    // Total: 12 combinations per benchmark
+    
+    reg [31:0] raw_cycles [0:9][0:2];              // Raw cycles per mode
+    reg [31:0] eff_time [0:9][0:2][0:5];           // Effective time [bench][mode][clk_idx]
+    reg [1:0]  best_mode [0:9];
+    reg [2:0]  best_clk_idx [0:9];                 // 0=1.0x, 1=1.1x, ... 5=1.5x
+    reg [31:0] best_eff [0:9];
+    
+    // Features
+    reg signed [31:0] feat_branch [0:9];
+    reg signed [31:0] feat_ratio [0:9];
+    reg signed [31:0] feat_stall [0:9];
+    
+    // Clock multipliers (x100)
+    integer clk_mult [0:5];
+    initial begin
+        clk_mult[0] = 100;  // 1.0x
+        clk_mult[1] = 110;  // 1.1x
+        clk_mult[2] = 120;  // 1.2x
+        clk_mult[3] = 130;  // 1.3x
+        clk_mult[4] = 140;  // 1.4x
+        clk_mult[5] = 150;  // 1.5x
+    end
+    
+    // Max clock index per mode (physical constraint)
+    integer max_clk_idx [0:2];
+    initial begin
+        max_clk_idx[0] = 1;  // P3: max 1.1x (index 1)
+        max_clk_idx[1] = 3;  // P5: max 1.3x (index 3)
+        max_clk_idx[2] = 5;  // P7: max 1.5x (index 5)
+    end
+    
+    
+    // PERCEPTRON WEIGHTS FOR CLOCK SELECTION
+    
+    // The perceptron learns: given features, what clock index is safe/optimal?
+    
+    reg signed [15:0] w_clk_branch;
+    reg signed [15:0] w_clk_ratio;
+    reg signed [15:0] w_clk_stall;
+    reg signed [15:0] w_clk_bias;
+    
+    // Mode selection thresholds
+    integer thresh_p3_branch;
+    integer thresh_p7_branch;
+    integer thresh_p7_ratio;
+    integer thresh_p5_stall;
+    
+    integer bench, mode_idx, clk_idx, i, epoch;
+    reg [31:0] cyc, eff, insts;
+    reg timeout;
+    reg [1:0] pred_mode;
+    reg [2:0] pred_clk_idx;
+    integer errors;
+    
+    wire halted_branch   = (dut.rf_inst.regs[3] == 32'd40);
+    wire halted_loaduse  = (dut.rf_inst.regs[10] == 32'd10);
+    wire halted_alu      = (dut.rf_inst.regs[1] == 32'd16) && (dut.rf_inst.regs[10] == 32'd15);
+    wire halted_mixed    = (dut.rf_inst.regs[31] == 32'd99);
+    wire halted_compute  = (dut.rf_inst.regs[10] == 32'd20);
+    wire halted_stream   = (dut.rf_inst.regs[10] == 32'd30);
+    wire halted_tightloop= (dut.rf_inst.regs[10] == 32'd50);
+    wire halted_nested   = (dut.rf_inst.regs[10] == 32'd8);
+    wire halted_switch   = (dut.rf_inst.regs[10] == 32'd40);
+    wire halted_vector   = (dut.rf_inst.regs[10] == 32'd20);
+    
+    reg halted;
+    
+    
+    // PREDICTION TASK
+    
+    task predict;
+        input [31:0] br;
+        input [31:0] ratio;
+        input [31:0] st;
+        output [1:0] p_mode;
+        output [2:0] p_clk;
+        
+        reg signed [31:0] clk_score;
+        integer max_idx;
+        begin
+            // Step 1: Decide MODE using decision tree
+            if (br >= thresh_p3_branch && ratio > 40) begin
+                p_mode = 2'b00;  // P3
+            end
+            else if (br <= thresh_p7_branch && ratio <= thresh_p7_ratio) begin
+                p_mode = 2'b10;  // P7
+            end
+            else if (st >= thresh_p5_stall) begin
+                p_mode = 2'b01;  // P5
+            end
+            else begin
+                if (br > 20) p_mode = 2'b00;
+                else if (ratio < 25) p_mode = 2'b10;
+                else p_mode = 2'b01;
+            end
+            
+            // Step 2: Decide CLOCK using perceptron (within mode's range)
+            // Higher score = can safely use higher clock
+            clk_score = w_clk_bias + 
+                        (w_clk_branch * (100 - br)) / 100 +      // Low branches = higher clock OK
+                        (w_clk_ratio * (100 - ratio)) / 100 +    // Low ratio = higher clock OK
+                        (w_clk_stall * (100 - st)) / 100;        // Low stalls = higher clock OK
+            
+            // Get max allowed clock for this mode
+            max_idx = max_clk_idx[p_mode];
+            
+            // Map score to clock index (0 to max_idx)
+            // Score range roughly 0-100, map to 0-max_idx
+            if (clk_score >= 90)
+                p_clk = max_idx;
+            else if (clk_score >= 75)
+                p_clk = (max_idx >= 4) ? max_idx - 1 : max_idx;
+            else if (clk_score >= 60)
+                p_clk = (max_idx >= 3) ? max_idx - 2 : (max_idx >= 1 ? max_idx - 1 : 0);
+            else if (clk_score >= 45)
+                p_clk = (max_idx >= 2) ? 2 : (max_idx >= 1 ? 1 : 0);
+            else if (clk_score >= 30)
+                p_clk = (max_idx >= 1) ? 1 : 0;
+            else
+                p_clk = 0;
+            
+            // Clamp to mode's maximum
+            if (p_clk > max_idx) p_clk = max_idx;
+        end
+    endtask
+    
+    initial begin
+        $dumpfile("cpu_morphable_top_tb.vcd");
+        $dumpvars(0, cpu_morphable_top_tb);
+        
+        // Initialize
+        thresh_p3_branch = 26;
+        thresh_p7_branch = 10;
+        thresh_p7_ratio = 25;
+        thresh_p5_stall = 10;
+        
+        w_clk_branch = 16'sd30;
+        w_clk_ratio = 16'sd25;
+        w_clk_stall = 16'sd20;
+        w_clk_bias = 16'sd25;
+        
+        $display("");
+        $display("================================================================");
+        $display("    MORPHABLE CPU - HYBRID AI PREDICTOR");
+        $display("================================================================");
+        $display("");
+        $display("The AI learns to select BOTH:");
+        $display("  1. Pipeline mode (P3, P5, P7)");
+        $display("  2. Clock multiplier within that mode's allowed range");
+        $display("");
+        $display("Physical Clock Constraints:");
+        $display("  P3: 1.0x, 1.1x");
+        $display("  P5: 1.0x, 1.1x, 1.2x, 1.3x");
+        $display("  P7: 1.0x, 1.1x, 1.2x, 1.3x, 1.4x, 1.5x");
+        $display("");
+        $display("================================================================");
+        $display("           PHASE 1: EXHAUSTIVE DATA COLLECTION");
+        $display("================================================================");
+        $display("Testing all valid (mode, clock) combinations...");
+        
+        
+        // PHASE 1: Run each benchmark and compute effective time for ALL clocks
+        
+        for (bench = 0; bench < 10; bench = bench + 1) begin
+            $display("");
+            case (bench)
+                0: $display("--- Benchmark %0d: Branch-Heavy ---", bench);
+                1: $display("--- Benchmark %0d: Load-Use ---", bench);
+                2: $display("--- Benchmark %0d: ALU-Intensive ---", bench);
+                3: $display("--- Benchmark %0d: Mixed (Bubble Sort) ---", bench);
+                4: $display("--- Benchmark %0d: Compute-Intensive ---", bench);
+                5: $display("--- Benchmark %0d: Memory-Streaming ---", bench);
+                6: $display("--- Benchmark %0d: Tight-Loop ---", bench);
+                7: $display("--- Benchmark %0d: Nested-Loops ---", bench);
+                8: $display("--- Benchmark %0d: Switch-Case ---", bench);
+                9: $display("--- Benchmark %0d: Vector-Ops ---", bench);
+            endcase
+            
+            best_eff[bench] = 32'hFFFFFFFF;
+            feat_branch[bench] = 0;
+            feat_ratio[bench] = 100;
+            feat_stall[bench] = 0;
+            
+            // Test each mode
+            for (mode_idx = 0; mode_idx < 3; mode_idx = mode_idx + 1) begin
+                mode_select = mode_idx[1:0];
+                auto_mode_enable = 1;
+                reset = 1;
+                
+                for (i = 0; i < 32; i = i + 1) dut.rf_inst.regs[i] = 0;
+                for (i = 0; i < 256; i = i + 1) dut.dmem_inst.mem[i] = 0;
+                for (i = 0; i < 256; i = i + 1) dut.imem_inst.mem[i] = 32'h00000013;
+                
+                case (bench)
+                    0: $readmemh("benches/bench_branch.hex", dut.imem_inst.mem);
+                    1: $readmemh("benches/bench_loaduse.hex", dut.imem_inst.mem);
+                    2: $readmemh("benches/bench_alu.hex", dut.imem_inst.mem);
+                    3: $readmemh("benches/bench_mixed.hex", dut.imem_inst.mem);
+                    4: $readmemh("benches/bench_compute.hex", dut.imem_inst.mem);
+                    5: $readmemh("benches/bench_stream.hex", dut.imem_inst.mem);
+                    6: $readmemh("benches/bench_tightloop.hex", dut.imem_inst.mem);
+                    7: $readmemh("benches/bench_nested.hex", dut.imem_inst.mem);
+                    8: $readmemh("benches/bench_switch.hex", dut.imem_inst.mem);
+                    9: $readmemh("benches/bench_vector.hex", dut.imem_inst.mem);
+                endcase
+                
+                #100; reset = 0;
+                
+                cyc = 0; timeout = 0; insts = 0;
+                for (i = 0; i < 15000; i = i + 1) begin
+                    @(posedge clk);
+                    case (bench)
+                        0: halted = halted_branch;
+                        1: halted = halted_loaduse;
+                        2: halted = halted_alu;
+                        3: halted = halted_mixed;
+                        4: halted = halted_compute;
+                        5: halted = halted_stream;
+                        6: halted = halted_tightloop;
+                        7: halted = halted_nested;
+                        8: halted = halted_switch;
+                        9: halted = halted_vector;
+                    endcase
+                    if (halted) begin 
+                        cyc = cycle_count;
+                        insts = inst_count;
+                        i = 99999; 
+                    end
+                end
+                
+                if (cyc == 0) begin cyc = 15000; insts = 1; timeout = 1; end
+                
+                raw_cycles[bench][mode_idx] = cyc;
+                
+                // Extract features from P5
+                if (mode_idx == 1 && !timeout && insts > 0) begin
+                    feat_branch[bench] = (flush_count * 100) / insts;
+                    feat_stall[bench] = (stall_count * 100) / cyc;
+                end
+                
+                // CPI ratio
+                if (mode_idx == 2 && !timeout && raw_cycles[bench][0] < 15000 && raw_cycles[bench][0] > 0) begin
+                    feat_ratio[bench] = ((cyc * 100) / raw_cycles[bench][0]) - 100;
+                    if (feat_ratio[bench] < 0) feat_ratio[bench] = 0;
+                end
+                
+                // Calculate effective time for each ALLOWED clock for this mode
+                case (mode_idx)
+                    0: $write("  P3: %4d cyc | Eff: ", cyc);
+                    1: $write("  P5: %4d cyc | Eff: ", cyc);
+                    2: $write("  P7: %4d cyc | Eff: ", cyc);
+                endcase
+                
+                for (clk_idx = 0; clk_idx <= max_clk_idx[mode_idx]; clk_idx = clk_idx + 1) begin
+                    if (timeout) begin
+                        eff_time[bench][mode_idx][clk_idx] = 32'hFFFF;
+                        $write("T/O ");
+                    end else begin
+                        eff = (cyc * 100) / clk_mult[clk_idx];
+                        eff_time[bench][mode_idx][clk_idx] = eff;
+                        $write("@%0d.%0dx=%0d.%02d ", clk_mult[clk_idx]/100, (clk_mult[clk_idx]/10)%10, eff/100, eff%100);
+                        
+                        // Track best overall
+                        if (eff < best_eff[bench]) begin
+                            best_eff[bench] = eff;
+                            best_mode[bench] = mode_idx[1:0];
+                            best_clk_idx[bench] = clk_idx[2:0];
+                        end
+                    end
+                end
+                $display("");
+            end
+            
+            // Show best
+            if (best_eff[bench] < 32'hFFFF) begin
+                $write("  >>> BEST: P");
+                case (best_mode[bench])
+                    2'b00: $write("3");
+                    2'b01: $write("5");
+                    2'b10: $write("7");
+                endcase
+                $display(" @ %0d.%0dx (eff=%0d.%02d) | Features: br=%0d%%, ratio=%0d%%, stall=%0d%%",
+                         clk_mult[best_clk_idx[bench]]/100, (clk_mult[best_clk_idx[bench]]/10)%10,
+                         best_eff[bench]/100, best_eff[bench]%100,
+                         feat_branch[bench], feat_ratio[bench], feat_stall[bench]);
+            end
+        end
+        
+        
+        // PHASE 2: TRAIN AI!!!!!!!!!!!!!
+        
+        $display("");
+        $display("================================================================");
+        $display("           PHASE 2: TRAIN HYBRID AI");
+        $display("================================================================");
+        $display("");
+        
+        for (epoch = 0; epoch < 15; epoch = epoch + 1) begin
+            errors = 0;
+            
+            for (bench = 0; bench < 10; bench = bench + 1) begin
+                if (best_eff[bench] < 32'hFFFF) begin
+                    predict(feat_branch[bench], feat_ratio[bench], feat_stall[bench],
+                            pred_mode, pred_clk_idx);
+                    
+                    // Check mode prediction
+                    if (pred_mode != best_mode[bench]) begin
+                        errors = errors + 1;
+                        
+                        case (best_mode[bench])
+                            2'b00: begin
+                                if (feat_branch[bench] < thresh_p3_branch)
+                                    thresh_p3_branch = thresh_p3_branch - 2;
+                            end
+                            2'b01: begin
+                                if (feat_stall[bench] > 0 && feat_stall[bench] < thresh_p5_stall)
+                                    thresh_p5_stall = thresh_p5_stall - 2;
+                            end
+                            2'b10: begin
+                                if (feat_branch[bench] > thresh_p7_branch)
+                                    thresh_p7_branch = thresh_p7_branch + 1;
+                                if (feat_ratio[bench] > thresh_p7_ratio)
+                                    thresh_p7_ratio = thresh_p7_ratio + 2;
+                            end
+                        endcase
+                    end
+                    
+                    // Adjust clock weights based on what actually worked
+                    if (best_clk_idx[bench] == max_clk_idx[best_mode[bench]]) begin
+                        // Max clock was best - increase bias
+                        w_clk_bias = w_clk_bias + 1;
+                    end else begin
+                        // Lower clock was better - be more conservative
+                        w_clk_bias = w_clk_bias - 1;
+                    end
+                end
+            end
+            
+            $display("  Epoch %2d: %0d mode errors | Thresholds: P3_br>%0d, P7_br<%0d, P7_rat<%0d",
+                     epoch + 1, errors, thresh_p3_branch, thresh_p7_branch, thresh_p7_ratio);
+            
+            if (errors == 0) begin
+                $display("  >>> Perfect mode prediction! Stopping.");
+                epoch = 100;
+            end
+        end
+        
+        $display("");
+        $display("Final Learned Parameters:");
+        $display("  Mode: P3 if branch>%0d, P7 if branch<%0d & ratio<%0d, else P5",
+                 thresh_p3_branch, thresh_p7_branch, thresh_p7_ratio);
+        $display("  Clock: bias=%0d, w_branch=%0d, w_ratio=%0d, w_stall=%0d",
+                 w_clk_bias, w_clk_branch, w_clk_ratio, w_clk_stall);
+        
+        
+        // PHASE 3: FINAL TEST
+        
+        $display("");
+        $display("================================================================");
+        $display("           PHASE 3: FINAL PREDICTIONS");
+        $display("================================================================");
+        $display("");
+        $display("Benchmark       | Features (Br/Rat/St) | Actual       | Predicted    | Mode?");
+        $display("----------------|----------------------|--------------|--------------|------");
+        
+        begin : final_test
+            integer correct, total;
+            correct = 0; total = 0;
+            
+            for (bench = 0; bench < 10; bench = bench + 1) begin
+                if (best_eff[bench] < 32'hFFFF) begin
+                    total = total + 1;
+                    
+                    predict(feat_branch[bench], feat_ratio[bench], feat_stall[bench],
+                            pred_mode, pred_clk_idx);
+                    
+                    case (bench)
+                        0: $write("Branch-Heavy    ");
+                        1: $write("Load-Use        ");
+                        2: $write("ALU-Intensive   ");
+                        3: $write("Mixed (Bubble)  ");
+                        4: $write("Compute         ");
+                        5: $write("Mem-Stream      ");
+                        6: $write("Tight-Loop      ");
+                        7: $write("Nested-Loops    ");
+                        8: $write("Switch-Case     ");
+                        9: $write("Vector-Ops      ");
+                    endcase
+                    
+                    $write("| %2d%% / %2d%% / %2d%%      ",
+                           feat_branch[bench], feat_ratio[bench], feat_stall[bench]);
+                    
+                    $write("| P");
+                    case (best_mode[bench])
+                        2'b00: $write("3");
+                        2'b01: $write("5");
+                        2'b10: $write("7");
+                    endcase
+                    $write(" @ %0d.%0dx    ", clk_mult[best_clk_idx[bench]]/100, (clk_mult[best_clk_idx[bench]]/10)%10);
+                    
+                    $write("| P");
+                    case (pred_mode)
+                        2'b00: $write("3");
+                        2'b01: $write("5");
+                        2'b10: $write("7");
+                    endcase
+                    $write(" @ %0d.%0dx    ", clk_mult[pred_clk_idx]/100, (clk_mult[pred_clk_idx]/10)%10);
+                    
+                    if (pred_mode == best_mode[bench]) begin
+                        $display("| YES");
+                        correct = correct + 1;
+                    end else begin
+                        $display("| no");
+                    end
+                end
+            end
+            
+            $display("");
+            $display("================================================================");
+            $display("MODE PREDICTION ACCURACY: %0d/%0d (%0d%%)", correct, total, (correct*100)/total);
+            $display("================================================================");
+        end
+        
+        
+        // SUMMARY
+        
+        $display("");
+        $display("================================================================");
+        $display("                    FINAL SUMMARY");
+        $display("================================================================");
+        $display("");
+        $display("Optimal (Mode, Clock) for each benchmark:");
+        $display("Benchmark       | Mode | Clock | Cycles | Eff.Time | Speedup");
+        $display("----------------|------|-------|--------|----------|--------");
+        
+        for (bench = 0; bench < 10; bench = bench + 1) begin
+            case (bench)
+                0: $write("Branch-Heavy    ");
+                1: $write("Load-Use        ");
+                2: $write("ALU-Intensive   ");
+                3: $write("Mixed (Bubble)  ");
+                4: $write("Compute         ");
+                5: $write("Mem-Stream      ");
+                6: $write("Tight-Loop      ");
+                7: $write("Nested-Loops    ");
+                8: $write("Switch-Case     ");
+                9: $write("Vector-Ops      ");
+            endcase
+            
+            if (best_eff[bench] >= 32'hFFFF) begin
+                $display("| T/O  | -     | -      | -        | -");
+            end else begin
+                $write("| P");
+                case (best_mode[bench])
+                    2'b00: $write("3  ");
+                    2'b01: $write("5  ");
+                    2'b10: $write("7  ");
+                endcase
+                
+                $write("| %0d.%0dx  ", clk_mult[best_clk_idx[bench]]/100, (clk_mult[best_clk_idx[bench]]/10)%10);
+                $write("| %5d  ", raw_cycles[bench][best_mode[bench]]);
+                $write("| %5d.%02d ", best_eff[bench]/100, best_eff[bench]%100);
+                
+                // Speedup vs P3@1.0x
+                if (eff_time[bench][0][0] > 0 && eff_time[bench][0][0] < 32'hFFFF) begin
+                    $display("| %0d.%02dx", 
+                             (eff_time[bench][0][0] * 100) / best_eff[bench] / 100,
+                             ((eff_time[bench][0][0] * 100) / best_eff[bench]) % 100);
+                end else begin
+                    $display("| N/A");
+                end
+            end
+        end
+        
+        $display("");
+        $display("Win Count:");
+        begin : wins
+            integer p3w, p5w, p7w;
+            p3w = 0; p5w = 0; p7w = 0;
+            for (bench = 0; bench < 10; bench = bench + 1) begin
+                if (best_eff[bench] < 32'hFFFF) begin
+                    case (best_mode[bench])
+                        2'b00: p3w = p3w + 1;
+                        2'b01: p5w = p5w + 1;
+                        2'b10: p7w = p7w + 1;
+                    endcase
+                end
+            end
+            $display("  P3: %0d wins | P5: %0d wins | P7: %0d wins", p3w, p5w, p7w);
+        end
+        
+        $display("");
+        $display("================================================================");
+        $display("AI Predictor Output:");
+        $display("");
+        $display("  Given: branch%%, CPI_ratio%%, stall%%");
+        $display("  Output: (Mode, Clock) where clock is CHOSEN within mode's range");
+        $display("");
+        $display("  Example: branch=6%%, ratio=19%%, stall=0%%");
+        $display("    -> Mode=P7 (low branch, low ratio)");
+        $display("    -> Clock=1.5x (high score, max allowed for P7)");
+        $display("");
+        $display("  Example: branch=35%%, ratio=80%%, stall=0%%");
+        $display("    -> Mode=P3 (high branch)");
+        $display("    -> Clock=1.1x (max allowed for P3)");
+        $display("================================================================");
+        
+        $finish;
+    end
+endmodule
