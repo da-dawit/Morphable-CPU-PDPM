@@ -1,13 +1,13 @@
 `timescale 1ns/1ps
 
-// MORPHABLE CPU - 100-BENCHMARK TESTBENCH
+// MORPHABLE CPU - 108-BENCHMARK TESTBENCH
 // =========================================
-// Benchmarks 0-9:   Original (custom halt conditions)
-// Benchmarks 10-99: New (universal halt: x31 == 0xDEAD = 57005)
-// NEWEST
+// Benchmarks 0-9:     Original (custom halt conditions)
+// Benchmarks 10-99:   Generated (universal halt: x31 == 0xDEAD = 57005)
+// Benchmarks 100-107: C-compiled real programs (universal halt)
 
 `define SIMULATION
-`define NUM_BENCHMARKS 100
+`define NUM_BENCHMARKS 108
 
 module cpu_morphable_top_tb;
 
@@ -122,10 +122,12 @@ module cpu_morphable_top_tb;
 
         $display("");
         $display("================================================================");
-        $display("  MORPHABLE CPU - 100-BENCHMARK EVALUATION");
+        $display("  MORPHABLE CPU - 108-BENCHMARK EVALUATION");
         $display("================================================================");
-        $display("  Benchmarks 0-9:   Original (custom halt)");
-        $display("  Benchmarks 10-99: Generated (universal halt x31=0xDEAD)");
+        $display("  Benchmarks 0-9:     Original (custom halt)");
+        $display("  Benchmarks 10-99:   Generated (universal halt x31=0xDEAD)");
+        $display("  Benchmarks 100-107: C-compiled (matmul, CRC, qsort, bsearch,");
+        $display("                       string, linkedlist, fibonacci, dhrystone)");
         $display("");
         $display("  Modes: P3 (max 1.1x), P5 (max 1.3x), P7 (max 1.5x)");
         $display("================================================================");
@@ -264,6 +266,15 @@ module cpu_morphable_top_tb;
                             97: $readmemh("benches/bench_097.hex", dut.imem_inst.mem);
                             98: $readmemh("benches/bench_098.hex", dut.imem_inst.mem);
                             99: $readmemh("benches/bench_099.hex", dut.imem_inst.mem);
+                            // C-compiled real benchmarks (100-107)
+                            100: $readmemh("benches/bench_c_matmul.hex", dut.imem_inst.mem);
+                            101: $readmemh("benches/bench_c_crc.hex", dut.imem_inst.mem);
+                            102: $readmemh("benches/bench_c_qsort.hex", dut.imem_inst.mem);
+                            103: $readmemh("benches/bench_c_bsearch.hex", dut.imem_inst.mem);
+                            104: $readmemh("benches/bench_c_string.hex", dut.imem_inst.mem);
+                            105: $readmemh("benches/bench_c_linkedlist.hex", dut.imem_inst.mem);
+                            106: $readmemh("benches/bench_c_fib.hex", dut.imem_inst.mem);
+                            107: $readmemh("benches/bench_c_dhrystone.hex", dut.imem_inst.mem);
                         endcase
                     end
                 endcase
