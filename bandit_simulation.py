@@ -298,14 +298,14 @@ class JointPerceptron:
     """
     name = "Joint Perceptron"
     
-    def __init__(self, n_features=4, lr=0.1):
+    def __init__(self, n_features=4, lr=0.5):
         self.n_features = n_features
         self.lr = lr
         self.reset()
     
     def reset(self):
         rng = np.random.RandomState(42)
-        self.weights = rng.randn(N_CONFIGS, self.n_features) * 0.01
+        self.weights = rng.randn(N_CONFIGS, self.n_features) * 0.1
         self._tried = [False] * N_CONFIGS
         self._round = 0
         self._bench = None
@@ -345,7 +345,7 @@ class JointPerceptronWithPhase(JointPerceptron):
     """Joint Perceptron + Phase Memory. The full PDPM system."""
     name = "Joint Perceptron + Phase"
     
-    def __init__(self, n_features=4, lr=0.1):
+    def __init__(self, n_features=4, lr=0.5):
         super().__init__(n_features, lr)
         self.phase_mem = {}
         self.phase_conf = {}
@@ -459,8 +459,8 @@ def run_experiments(eff12, feature_db):
             RandomPolicy(),
             ModeOnlyOracle(eff12),
             UCB1_12(c=2.0),
-            JointPerceptron(lr=0.1),
-            JointPerceptronWithPhase(lr=0.1),
+            JointPerceptron(lr=0.5),
+            JointPerceptronWithPhase(lr=0.5),
             FullOracle(eff12),
         ]
         results = {}
@@ -474,9 +474,9 @@ def run_experiments(eff12, feature_db):
     train = valid[:30]
     test = valid[30:]
     
-    perc = JointPerceptron(lr=0.1)
+    perc = JointPerceptron(lr=0.5)
     perc.reset()
-    simulate(perc, make_workload(train, 1000, 5), eff12, feature_db, interval=200)
+    simulate(perc, make_workload(train, 1000, 20), eff12, feature_db, interval=200)
     
     # Freeze and test
     frozen = JointPerceptron(lr=0.0)
@@ -630,7 +630,7 @@ def plot_generalization(gen_results, outdir):
 
 def plot_weights(eff12, feature_db, outdir):
     """Train a perceptron on all data and visualize weights."""
-    perc = JointPerceptron(lr=0.05)
+    perc = JointPerceptron(lr=0.5)
     perc.reset()
     all_b = sorted(eff12.keys())
     for _ in range(50):

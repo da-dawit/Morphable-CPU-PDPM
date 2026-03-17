@@ -1,133 +1,192 @@
-# Morphable RISC-V CPU
+# PDPM: Perceptron-Driven Pipeline Morphing for Adaptive RISC-V Processors
 
-A dynamically reconfigurable RISC-V processor that can switch between 3-stage, 5-stage, and 7-stage pipeline configurations at runtime. Built for the UPduino 3.1 FPGA.
+A dynamically reconfigurable RISC-V processor that morphs its pipeline between 3, 5, and 7 stages at runtime, guided by an online perceptron that jointly predicts optimal pipeline depth AND clock frequency. Built for the UPduino 3.1 FPGA (Lattice iCE40 UP5K).
 
----
-
-## About This Project
-
-Hey! I'm Dawit, a computer engineering student, and this is my final project for my processor design course.
-
-I've always been fascinated by the tradeoffs in CPU design - why do some processors have 5 pipeline stages while others have 14? Why can't a processor just... adapt? That question led me down a rabbit hole that became this project.
-
-The idea is simple but (I think) pretty cool: what if a CPU could morph its own pipeline depth based on what code it's running? Branch-heavy code? Use a shorter pipeline to minimize misprediction penalties. Compute-heavy loops? Switch to a deeper pipeline that can run at higher clock speeds.
-
-I spent way too many late nights debugging hazard detection logic and figuring out why my forwarding unit wasn't forwarding. But honestly? I loved every minute of it. There's something deeply satisfying about watching your own CPU execute instructions correctly for the first time.
+**Paper:** *"PDPM: Perceptron-Driven Pipeline Morphing for Adaptive RISC-V Processors"* — Dawit Chun (Taejae University) and Han-seok Ko (The Catholic University of America)
 
 ---
 
-## Architecture Overview
+## The Idea
 
-### The Three Modes
+A fixed-depth pipeline is always a compromise. Branch-heavy code wants a short pipeline (fewer wasted cycles on flushes). Compute-heavy code wants a deep pipeline running at maximum clock. What if the processor could learn which configuration is best — during execution, with no prior training?
 
-P3 Mode (3-stage pipeline)
+PDPM does exactly this. It extends Jiménez and Lin's perceptron branch predictor (HPCA 2001) from predicting branch direction (binary) to predicting microarchitectural configuration (12-class: 3 pipeline depths × 4–6 clock speeds each). The result: **14× less wasted performance** compared to a fixed pipeline, for **under 1% hardware cost**.
+
+---
+
+## Key Results
+
+| Metric | Value |
+|--------|-------|
+| Overhead vs. perfect oracle (online) | **0.560–3.698%** across 5 workload scenarios |
+| Fixed P5@1.0× baseline waste | 34.253% (what PDPM eliminates) |
+| Generalization (train 30, test 78 unseen) | **+0.003% overhead**, 97.436% config accuracy |
+| Oracle performance captured | **99.997%** with 48 bytes of learned weights |
+| UCB1 bandit on same unseen workloads | +45.035% overhead (vs PDPM's +0.003%) |
+| PDPM+Phase on repeating workloads | **+0.560%** (near-oracle via instant phase recall) |
+| Predictor hardware cost | <50 LUT4 cells (<1% of iCE40 UP5K) |
+| Total design size | ~3,600 LUTs (68% utilization) |
+
+---
+
+## Architecture
+
+### The Three Pipeline Modes
+
+**P3 — 3-stage (branch-optimized)**
 ```
-IF -> EX -> WB
+IF → EX → WB
 ```
-The simplest configuration. Instructions flow through fetch, execute (which handles decode, ALU, and memory), and writeback. Only 1-2 cycle branch penalty. Great for control-flow heavy code, but limited clock speed due to the long critical path in the execute stage. Maximum clock: 1.1x baseline.
+1-cycle branch penalty. Max clock: 1.1× base. Wins when β > 25%.
 
-P5 Mode (5-stage pipeline)
+**P5 — 5-stage (balanced)**
 ```
-IF -> ID -> EX -> MEM -> WB
+IF → ID → EX → MEM → WB
 ```
-The classic RISC pipeline that Patterson and Hennessy taught us. Balanced performance with proper hazard detection and data forwarding. This is the "safe" mode - it handles everything reasonably well. Maximum clock: 1.3x baseline.
+2-cycle branch penalty. Max clock: 1.3× base. Wins for mixed workloads (8% < β < 22%).
 
-P7 Mode (7-stage pipeline)
+**P7 — 7-stage (throughput-optimized)**
 ```
-IF1 -> IF2 -> ID -> EX1 -> EX2 -> MEM -> WB
+IF1 → IF2 → ID → EX1 → EX2 → MEM → WB
 ```
-The deep pipeline configuration. Split fetch and execute stages mean shorter critical paths, enabling higher clock frequencies. But there's a cost - branch mispredictions hurt more (5 cycles to flush), and we need extra forwarding paths. Worth it for compute-heavy workloads where the clock speed advantage outweighs the penalties. Maximum clock: 1.5x baseline.
+5-cycle branch penalty. Max clock: 1.5× base. Wins when β < 10%.
 
-### Key Components
+### Superset Design
 
-| Module | Description |
-|--------|-------------|
-| cpu_morphable_top | Top-level module that instantiates everything and handles mode switching |
-| pipeline_mode_ctrl_v2 | The brain - controls which pipeline stages are active |
-| forwarding_unit | Handles data forwarding for all three modes |
-| hazard_unit | Detects hazards and generates stalls/flushes |
-| perceptron_predictor | Hybrid AI predictor that learns optimal mode AND clock for workloads |
-| cpi_monitor | Tracks cycles-per-instruction for performance feedback |
+Rather than three separate pipelines, we implement P7 as a superset with **4 bypass multiplexers** that short-circuit stages for shallower modes:
 
-### The Hybrid AI Predictor
+| Mode | bp_if2 | bp_id_ex | bp_ex2 | bp_ex_mem | Active Stages |
+|------|--------|----------|--------|-----------|---------------|
+| P3   | 1      | 1        | 1      | 1         | 3             |
+| P5   | 1      | 0        | 1      | 0         | 5             |
+| P7   | 0      | 0        | 0      | 0         | 7             |
 
-This is the part I'm most proud of. I built a predictor that combines decision tree logic with perceptron-style learned weights. It predicts TWO things:
+### 12-Configuration Space
 
-1. Which pipeline mode to use (P3, P5, or P7)
-2. What clock multiplier to use (within each mode's physical constraints)
+Each mode supports a range of clock speeds constrained by its critical path:
 
-The predictor looks at three features extracted from the running code:
-- Branch percentage: How much of the code is branches?
-- CPI ratio: How much does the deeper pipeline hurt CPI compared to shallow?
-- Stall percentage: How often are we stalling for hazards?
+- **P3:** 1.0×, 1.1× (2 options)
+- **P5:** 1.0×, 1.1×, 1.2×, 1.3× (4 options)
+- **P7:** 1.0×, 1.1×, 1.2×, 1.3×, 1.4×, 1.5× (6 options)
 
-Physical Clock Constraints (these are real hardware limits):
-- P3: Can choose from 1.0x or 1.1x (long critical path limits options)
-- P5: Can choose from 1.0x, 1.1x, 1.2x, or 1.3x (medium critical path)
-- P7: Can choose from 1.0x, 1.1x, 1.2x, 1.3x, 1.4x, or 1.5x (short critical path)
+**Total: 12 valid configurations.** The gap between best and worst is 50–98% across benchmarks.
 
-The predictor learns to select BOTH the mode AND the optimal clock within that mode's allowed range. It doesn't just pick the maximum - it learns when to be aggressive vs conservative based on workload characteristics.
+---
 
-After training on my benchmark suite, it achieves 90% prediction accuracy for mode selection.
+## The Online Perceptron Predictor
 
-How it works:
+The core innovation: 12 perceptrons (one per configuration) score each option using 3 runtime features:
 
 ```
-INPUT                              OUTPUT
------                              ------
-Branch% = 6%       ----+
-                       |           Mode Selection (Decision Tree)
-CPI Ratio = 19%    ----+---> [Hybrid AI] ---> Mode: P7
-                       |           Clock Selection (Perceptron)
-Stall% = 0%        ----+      ---> Clock: 1.5x (chosen from P7's range: 1.0-1.5x)
-```
+s_c(x) = w_{c,0} + w_{c,1}·β + w_{c,2}·ρ + w_{c,3}·σ
 
-Another example with different workload:
-```
-Branch% = 35%      ----+
-                       |
-CPI Ratio = 80%    ----+---> [Hybrid AI] ---> Mode: P3
-                       |                 ---> Clock: 1.1x (chosen from P3's range: 1.0-1.1x)
-Stall% = 0%        ----+
-```
-
-The decision tree handles mode selection:
-```
-IF branch > 26% AND ratio > 40% THEN P3
-ELIF branch < 14% AND ratio < 33% THEN P7
-ELIF stall > 13% THEN P5
-ELSE use perceptron scores to decide
+where:
+  β = branch rate (0–35%)
+  ρ = CPI ratio: (P7_cycles − P3_cycles) / P3_cycles × 100
+  σ = stall rate from data hazards (0–23%)
 ```
 
-Then the perceptron selects clock speed within that mode's allowed range:
-```
-score = bias + w1*(100-branch) + w2*(100-ratio) + w3*(100-stall)
+**Prediction:** pick the configuration with the highest score.
+**Learning:** on misclassification, subtract ηx from the wrong config's weights, add ηx to the correct config's weights. Learning rate η = 0.5, 8-bit saturating arithmetic, no multipliers needed.
 
-For P3 (range: 1.0x-1.1x):
-  score > 50 -> 1.1x, else 1.0x
+### What the Perceptron Learns
 
-For P5 (range: 1.0x-1.3x):
-  score > 75 -> 1.3x, > 60 -> 1.2x, > 45 -> 1.1x, else 1.0x
+After training, only **3 of the 12 configurations** develop significant weights — always at maximum clock for the selected depth:
 
-For P7 (range: 1.0x-1.5x):
-  score > 90 -> 1.5x, > 75 -> 1.4x, > 60 -> 1.3x, > 45 -> 1.2x, > 30 -> 1.1x, else 1.0x
-```
+| Config | Branch% weight | CPI Ratio weight | Stall% weight | Bias | Interpretation |
+|--------|---------------|-----------------|---------------|------|----------------|
+| **P3@1.1×** | +0.47 | +0.56 | — | — | High branches + high CPI ratio → shallow pipeline |
+| **P5@1.3×** | −0.27 | — | +0.25 | +0.29 | Moderate branches + stalls → balanced pipeline |
+| **P7@1.5×** | — | −0.55 | — | +0.36 | Low CPI ratio → deep pipeline at max clock |
 
-The AI learns that:
-- Low branch% + low ratio = safe to push higher clocks
-- High branch% or high ratio = be conservative with clock speed
+The perceptron autonomously discovered that sub-optimal clock speeds are never worth selecting. It also recovered the analytical decision boundary (P3 wins when β > 22%) from data alone.
+
+### Hyperparameter Robustness
+
+A systematic grid search over learning rate (η) and training passes shows accuracy exceeds 93% across a wide stable region (η ≥ 0.35, passes ≥ 15). The selected operating point (η = 0.5, 20 passes) achieves 97.436% on unseen workloads.
+
+---
+
+## Benchmark Suite (108 total)
+
+### 10 Hand-Written Benchmarks
+
+| # | Benchmark | β(%) | σ(%) | P3 cycles | P5 cycles | P7 cycles | Best Config |
+|---|-----------|------|------|-----------|-----------|-----------|-------------|
+| 0 | Branch-Heavy | 30 | 0 | 164 | 204 | 282 | **P3@1.1×** |
+| 1 | Load-Use | 9 | 23 | 162 | 173 | 233 | P5@1.3× |
+| 2 | ALU-Intensive | 6 | 0 | 246 | 262 | 292 | **P7@1.5×** |
+| 3 | Bubble Sort | 14 | 7 | N/A | 401 | 507 | P5@1.3× |
+| 4 | Compute | 5 | 0 | 392 | 413 | 453 | **P7@1.5×** |
+| 5 | Memory Stream | 5 | 0 | 590 | 621 | 681 | **P7@1.5×** |
+| 6 | Tight Loop | 35 | 0 | 604 | 766 | 1088 | **P3@1.1×** |
+| 7 | Nested Loops | 22 | 0 | 352 | 413 | 533 | P5@1.3× |
+| 8 | Switch-Case | 26 | 0 | 543 | 644 | 844 | **P3@1.1×** |
+| 9 | Vector Ops | 6 | 0 | 307 | 328 | 368 | **P7@1.5×** |
+
+### 90 Generated Benchmarks
+
+10 categories × 3 sizes × 3 variants:
+Pure ALU, Branch-Heavy, Load-Store Stream, Load-Use Hazard, Mixed Nested Loops, Dependency Chains, Independent ALU, Branch Patterns, Fibonacci, Memory Copy.
+
+### 8 C-Compiled Benchmarks
+
+Compiled with `riscv-none-elf-gcc` 15.2.0 (`-march=rv32i -mabi=ilp32 -O2`):
+
+| Benchmark | Cycles | β(%) | Best | Notes |
+|-----------|--------|------|------|-------|
+| Matrix Multiply (4×4) | 81 | 0 | **P7@1.5×** | Unrolled, no start.S |
+| Shift-XOR CRC | 73 | 0 | **P7@1.5×** | Unrolled, no start.S |
+| Decision Tree (3×16) | 863 | 28 | **P3@1.1×** | Dense if/else |
+| State Machine | 2,762 | 29 | **P3@1.1×** | Branch maze |
+| Branch Storm | 1,458 | 21 | P5@1.3× | Mixed control flow |
+| Pointer Chase | 1,234 | 13 | P5@1.3× | Load-use chains |
+| Vector Ops | 210 | 1 | P5@1.3× | Stall-dominated |
+| Dhrystone Mix | 3,115 | 13 | P5@1.3× | General-purpose |
+
+### Oracle Distribution
+
+- **P3@1.1×:** 14 benchmarks (13%)
+- **P5@1.3×:** 50 benchmarks (46%)
+- **P7@1.5×:** 44 benchmarks (41%)
+
+---
+
+## Comparison vs. Other Policies
+
+### Overhead vs. Perfect Oracle (%)
+
+| Policy | Original-10 | ALU-vs-Branch | Mixed-New | Full-50 | Repeating |
+|--------|-------------|---------------|-----------|---------|-----------|
+| Always P5@1.0× | 34.253 | 34.878 | 32.022 | 34.157 | 36.780 |
+| Always P5@1.3× | 3.271 | 3.753 | 1.555 | 3.198 | 5.215 |
+| UCB1 (12-arm) | 26.114 | 25.545 | 21.091 | 21.503 | 23.836 |
+| **PDPM** | **1.801** | **2.534** | **2.376** | **3.687** | **2.013** |
+| **PDPM+Phase** | **2.673** | **1.803** | **2.388** | **3.698** | **0.560** |
+
+### Generalization (train on 30, test on 78 unseen)
+
+| Policy | Overhead | Config Accuracy |
+|--------|----------|----------------|
+| Always P5@1.0× | +31.726% | 0.000% |
+| Always P5@1.3× | +1.328% | 57.692% |
+| UCB1 (12-arm) | +45.035% | 8.718% |
+| **PDPM (frozen weights)** | **+0.003%** | **97.436%** |
 
 ---
 
 ## Hardware
 
-Target FPGA: UPduino 3.1 (Lattice iCE40 UP5K)
-- 5.3K LUTs
-- 1Mb SPRAM
-- 120Kb DPRAM
-- 8 multipliers
+**Target:** UPduino 3.1 (Lattice iCE40 UP5K)
 
-The UPduino is a tiny, affordable FPGA that forced me to be efficient with my design. Every LUT counts when you're trying to fit three different pipeline configurations into 5K logic elements.
+| Resource | Available | Used | Utilization |
+|----------|-----------|------|-------------|
+| Logic Cells (LUT4) | 5,280 | ~3,600 | 68% |
+| Block RAM | 120 Kb | 8 blocks | 27% |
+| Multipliers | 8 | 0 | 0% |
+| Predictor overhead | — | <50 LUTs | <1% |
+
+Synthesis: Yosys + nextpnr. Simulation: Icarus Verilog.
 
 ---
 
@@ -135,98 +194,70 @@ The UPduino is a tiny, affordable FPGA that forced me to be efficient with my de
 
 ```
 morphable-cpu/
-├── benches/                    # Benchmark programs (.hex files)
-│   ├── bench_branch.hex        # Branch-heavy workload
-│   ├── bench_loaduse.hex       # Load-use dependency patterns
-│   ├── bench_alu.hex           # ALU-intensive computation
-│   ├── bench_mixed.hex         # Bubble sort (mixed operations)
-│   ├── bench_compute.hex       # Pure computation
-│   ├── bench_stream.hex        # Memory streaming
-│   ├── bench_tightloop.hex     # Tight loop branches
-│   ├── bench_nested.hex        # Nested loops
-│   ├── bench_switch.hex        # Switch-case patterns
-│   └── bench_vector.hex        # Vector-style operations
+├── benches/                        # 108 benchmark programs (.hex files)
+│   ├── bench_branch.hex ... bench_vector.hex    # 10 hand-written
+│   ├── bench_gen_*.hex                          # 90 generated
+│   └── bench_c_*.hex                            # 8 C-compiled
 │
-├── cpu_morphable_top.v         # Top-level CPU module
-├── pipeline_mode_ctrl_v2.v     # Mode switching controller
-├── alu.v                       # Arithmetic Logic Unit
-├── rf.v                        # Register File (32 registers)
-├── imem.v                      # Instruction Memory
-├── dmem.v                      # Data Memory
-├── immgen.v                    # Immediate Generator
-├── branch_resolution.v         # Branch target calculation
-├── bc.v                        # Branch condition evaluation
+├── c_benchmarks/                   # C source for compiled benchmarks
+│   ├── bench_matmul.c              # 4×4 matrix multiply
+│   ├── bench_crc.c                 # Shift-XOR CRC
+│   ├── bench_qsort.c              # Decision tree classifier
+│   ├── bench_bsearch.c            # State machine
+│   ├── bench_string.c             # Branch storm
+│   ├── bench_linkedlist.c         # Pointer chase
+│   ├── bench_fib.c                # Vector ops
+│   ├── bench_dhrystone.c          # Dhrystone mix
+│   ├── start.S                    # Startup code
+│   ├── link.ld                    # Linker script
+│   ├── elf2hex.py                 # ELF to hex converter
+│   └── build.bat                  # Build script
 │
-├── if_id_reg.v                 # IF/ID pipeline register
-├── id_ex_reg.v                 # ID/EX pipeline register
-├── ex_mem_reg.v                # EX/MEM pipeline register
-├── mem_wb_reg.v                # MEM/WB pipeline register
-├── if1_if2_reg.v               # IF1/IF2 register (P7 mode)
-├── ex1_ex2_reg.v               # EX1/EX2 register (P7 mode)
+├── cpu_morphable_top.v            # Top-level CPU (871 lines)
+├── pipeline_mode_ctrl_v2.v        # Mode controller (module: pipeline_mode_ctrl_v3)
+├── perceptron_predictor.v         # Joint perceptron (module: perceptron_predictor_v2)
+├── cpi_monitor.v                  # Performance monitoring
 │
-├── forwarding_unit.v           # Data forwarding logic
-├── hazard_unit.v               # Hazard detection
-├── control_pipeline.v          # Control signal generation
+├── alu.v                          # Arithmetic Logic Unit
+├── rf.v                           # Register File (32 registers)
+├── imem.v                         # Instruction Memory
+├── dmem.v                         # Data Memory
+├── immgen.v                       # Immediate Generator
+├── branch_resolution.v            # Branch target calculation
+├── bc.v                           # Branch condition evaluation
 │
-├── perceptron_predictor.v      # Hybrid AI mode/clock predictor
-├── cpi_monitor.v               # Performance monitoring
+├── if_id_reg.v                    # IF/ID pipeline register
+├── id_ex_reg.v                    # ID/EX pipeline register
+├── ex_mem_reg.v                   # EX/MEM pipeline register
+├── mem_wb_reg.v                   # MEM/WB pipeline register
+├── if1_if2_reg.v                  # IF1/IF2 register (P7 mode)
+├── ex1_ex2_reg.v                  # EX1/EX2 register (P7 mode)
 │
-├── cpu_morphable_top_tb.v      # Main testbench with AI training
-├── upduino_top.v               # FPGA top-level wrapper
-├── upduino_top.pcf             # Pin constraint file
+├── forwarding_unit.v              # Data forwarding (4 sources, mode-aware)
+├── hazard_unit.v                  # Hazard detection
+├── control_pipeline.v             # Control signal generation
 │
-├── assembler                   # Simple assembler tool
-└── README.md                   # You are here!
+├── cpu_morphable_top_tb.v         # Testbench (108 benchmarks, 416 lines)
+├── upduino_top.v                  # FPGA top-level wrapper
+├── upduino_top.pcf                # Pin constraint file
+│
+├── bandit_simulation.py           # Joint predictor evaluation (789 lines)
+├── gen_benchmarks.py              # Benchmark generator
+├── results/                       # Figures (PNG + PDF)
+│   ├── summary_table.png          # Color-coded overhead comparison
+│   ├── generalization.png         # Train/test bar chart (97.436%)
+│   ├── joint_weights.png          # 12×4 weight heatmap
+│   ├── hyperparam_heatmap.png     # η × passes accuracy search
+│   ├── regret_Full-50.png         # Cumulative regret curves
+│   ├── lr_sensitivity.png         # Accuracy vs learning rate
+│   ├── training_convergence.png   # Accuracy vs training passes
+│   └── ...                        # Additional regret/analysis plots
+│
+├── trace_log.csv                  # Simulation trace (3.79 MB, 165K events)
+└── README.md
 ```
 
----
-
-## Results
-
-### Benchmark Performance
-
-After running all 10 benchmarks across all three modes with realistic clock scaling:
-
-| Benchmark | Best Mode | Clock | Cycles | Eff. Time | Speedup |
-|-----------|-----------|-------|--------|-----------|---------|
-| Branch-Heavy | P3 | 1.1x | 163 | 1.48 | 1.10x |
-| Load-Use | P5 | 1.3x | 172 | 1.32 | 1.21x |
-| ALU-Intensive | P7 | 1.5x | 291 | 1.94 | 1.26x |
-| Mixed (Bubble Sort) | P5 | 1.3x | 400 | 3.07 | N/A |
-| Compute | P7 | 1.5x | 452 | 3.01 | 1.29x |
-| Memory-Stream | P7 | 1.5x | 680 | 4.53 | 1.30x |
-| Tight-Loop | P3 | 1.1x | 603 | 5.48 | 1.10x |
-| Nested-Loops | P5 | 1.3x | 412 | 3.16 | 1.11x |
-| Switch-Case | P3 | 1.1x | 542 | 4.92 | 1.10x |
-| Vector-Ops | P7 | 1.5x | 367 | 2.44 | 1.25x |
-
-### Win Distribution
-- P3: 3 wins (branch-heavy workloads)
-- P5: 3 wins (mixed workloads, hazard-heavy code)
-- P7: 4 wins (compute-heavy workloads)
-
-### Predictor Accuracy
-The hybrid AI predictor achieves 90% accuracy in selecting the optimal pipeline mode based on workload characteristics.
-
-### Key Insight
-No single pipeline depth is best for all workloads. The morphable approach allows the CPU to adapt:
-- P3 wins when branch penalty savings outweigh the clock speed loss
-- P5 wins for balanced workloads that need good hazard handling
-- P7 wins when the 1.5x clock advantage overcomes the deeper pipeline overhead
-
----
-
-## What I Learned
-
-1. Hazard detection is harder than it looks. Especially in P7 mode where you need to check both EX1 and EX2 stages for load-use hazards. I spent three days debugging an infinite stall issue before realizing the load instruction was never advancing through the pipeline.
-
-2. Forwarding paths multiply quickly. P5 needs forwarding from EX/MEM and MEM/WB. P7 adds EX2 as another source. The priority logic gets tricky.
-
-3. Simple ML can work. I started with a pure perceptron and it completely failed (0% accuracy - it kept oscillating). Switching to a hybrid decision tree + perceptron approach got me to 90%. Sometimes the right structure matters more than fancy algorithms.
-
-4. Clock frequency is the hidden variable. In simulation, P3 always looks best because it has fewer cycles. But in real hardware, deeper pipelines can run faster. Accounting for realistic physical constraints changed my results completely.
-
-5. Testing saves sanity. I wrote 10 different benchmarks specifically designed to stress different aspects of the pipeline. Every time I thought I was done, a new benchmark would expose a bug.
+**Total:** ~4,000 lines of Verilog, 789 lines Python evaluation, 108 benchmarks.
 
 ---
 
@@ -234,14 +265,34 @@ No single pipeline depth is best for all workloads. The morphable approach allow
 
 ### Simulation
 ```bash
-# Run the testbench
-apio sim
-
-# View waveforms
-gtkwave cpu_morphable_top_tb.vcd
+# Run all 108 benchmarks in all 3 modes
+iverilog -o morphable_tb cpu_morphable_top_tb.v cpu_morphable_top.v \
+  pipeline_mode_ctrl_v2.v perceptron_predictor.v cpi_monitor.v \
+  alu.v rf.v imem.v dmem.v immgen.v branch_resolution.v bc.v \
+  forwarding_unit.v hazard_unit.v control_pipeline.v \
+  if_id_reg.v id_ex_reg.v ex_mem_reg.v mem_wb_reg.v \
+  if1_if2_reg.v ex1_ex2_reg.v
+vvp morphable_tb
 ```
 
-### Synthesis (UPduino 3.1)
+### Run Predictor Evaluation
+```bash
+# Requires: trace_log.csv in same directory
+python3 bandit_simulation.py
+# Outputs all figures to results/ folder
+```
+
+### C Benchmark Compilation
+```bash
+cd c_benchmarks
+# Requires: riscv-none-elf-gcc (xPack 15.2.0)
+riscv-none-elf-gcc -march=rv32i -mabi=ilp32 -nostdlib -nostartfiles \
+  -O2 -ffreestanding -fno-builtin -T link.ld -Wl,--no-relax \
+  -o bench.elf start.S bench_program.c
+python3 elf2hex.py bench.elf > ../benches/bench_c_program.hex
+```
+
+### FPGA Synthesis (UPduino 3.1)
 ```bash
 apio build
 apio upload
@@ -249,235 +300,29 @@ apio upload
 
 ---
 
-## Future Work
+## Key Engineering Challenges
 
-If I had more time, I'd love to explore:
+**JALR Bug (P5/P7):** Function returns (`ret` = `jalr x0, ra, 0`) computed wrong targets in P5/P7 because `is_jalr` was read from the decode stage after the instruction had already moved to execute. Fix: derive `is_jalr` from `ex_a_sel` (JAL sets `a_sel=1`, JALR sets `a_sel=0`), with an extra pipeline register for P7's EX2 stage. This bug caused all 8 C benchmarks to fail until corrected.
 
-- Dynamic mode switching during execution: Right now modes are set at reset. True runtime switching mid-program would be amazing.
-- Branch prediction integration: A good branch predictor could change which mode is optimal.
-- Power analysis: Does P3 use less power than P7? Probably, but I'd like to measure it.
-- More pipeline depths: Why stop at 7? What about P9 or P11?
+**Clock Normalization Trap:** Raw cycle counts always favor P3 (fewer stages = fewer cycles). But after clock normalization, the ranking reverses for compute workloads. Equal-frequency comparisons are misleading — this is why the predictor must learn from *effective time*, not raw cycles.
 
----
-
-## Acknowledgments
-
-Thanks to my professor for letting me pursue this slightly crazy idea, and to everyone who listened to me ramble about pipeline hazards at 2 AM.
-
-Special thanks to the open-source FPGA community - tools like Yosys, nextpnr, and the IceStorm project made this possible on my student budget.
+**Generated Benchmark Halt:** All generated benchmarks use a universal halt via `ADDI + SLLI` to write `0xDEAD` to `x31` (no LUI needed, which avoids instruction encoding issues on the iCE40).
 
 ---
 
 ## References
 
-- Patterson & Hennessy, Computer Organization and Design: RISC-V Edition
-- Hennessy & Patterson, Computer Architecture: A Quantitative Approach
-- RISC-V Specification (riscv.org)
+- Patterson & Hennessy, *Computer Organization and Design: RISC-V Edition* (2017)
+- Hennessy & Patterson, *Computer Architecture: A Quantitative Approach*, 6th ed. (2019)
+- Jiménez & Lin, "Dynamic branch prediction with perceptrons," HPCA 2001
+- Hrishikesh et al., "The optimal logic depth per pipeline stage is 6 to 8 FO4," ISCA 2002
+- Auer et al., "Finite-time analysis of the multiarmed bandit problem," Machine Learning 2002
+- RISC-V ISA Specification v2.2 (riscv.org)
+- Lattice iCE40 UltraPlus Data Sheet (FPGA-DS-02008)
 - UPduino 3.1 Documentation (tinyvision.ai)
 
 ---
 
-This project represents countless hours of learning, debugging, and occasionally yelling at my monitor. If you're a student working on something similar - keep going. The moment your CPU executes its first instruction correctly is worth all the frustration.
+*This project represents a lot of late nights, subtle pipeline bugs, and the satisfaction of watching a CPU learn to optimize itself. If you're working on something similar — keep going.*
 
 — Dawit
-
-## Logs
-================================================================
-MORPHABLE CPU - HYBRID AI PREDICTOR
-================================================================
-
-The AI learns to select BOTH:
-1. Pipeline mode (P3, P5, P7)
-2. Clock multiplier within that mode's allowed range
-
-Physical Clock Constraints:
-P3: 1.0x, 1.1x
-P5: 1.0x, 1.1x, 1.2x, 1.3x
-P7: 1.0x, 1.1x, 1.2x, 1.3x, 1.4x, 1.5x
-
-================================================================
-PHASE 1: EXHAUSTIVE DATA COLLECTION
-================================================================
-Testing all valid (mode, clock) combinations...
-
---- Benchmark 0: Branch-Heavy ---
-WARNING: cpu_morphable_top_tb.v:267: $readmemh(benches/bench_branch.hex): Not enough words in the file for the requested range [0:255].
-WARNING: imem.v:19: $readmemh(prog.hex): Not enough words in the file for the requested range [0:255].
-P3:  163 cyc | Eff: @1.0x=1.63 @1.1x=1.48
-WARNING: cpu_morphable_top_tb.v:267: $readmemh(benches/bench_branch.hex): Not enough words in the file for the requested range [0:255].
-P5:  203 cyc | Eff: @1.0x=2.03 @1.1x=1.84 @1.2x=1.69 @1.3x=1.56
-WARNING: cpu_morphable_top_tb.v:267: $readmemh(benches/bench_branch.hex): Not enough words in the file for the requested range [0:255].
-P7:  281 cyc | Eff: @1.0x=2.81 @1.1x=2.55 @1.2x=2.34 @1.3x=2.16 @1.4x=2.00 @1.5x=1.87
->>> BEST: P3 @ 1.1x (eff=1.48) | Features: br=30%, ratio=72%, stall=0%
-
---- Benchmark 1: Load-Use ---
-WARNING: cpu_morphable_top_tb.v:268: $readmemh(benches/bench_loaduse.hex): Not enough words in the file for the requested range [0:255].
-P3:  161 cyc | Eff: @1.0x=1.61 @1.1x=1.46
-WARNING: cpu_morphable_top_tb.v:268: $readmemh(benches/bench_loaduse.hex): Not enough words in the file for the requested range [0:255].
-P5:  172 cyc | Eff: @1.0x=1.72 @1.1x=1.56 @1.2x=1.43 @1.3x=1.32
-WARNING: cpu_morphable_top_tb.v:268: $readmemh(benches/bench_loaduse.hex): Not enough words in the file for the requested range [0:255].
-P7:  232 cyc | Eff: @1.0x=2.32 @1.1x=2.10 @1.2x=1.93 @1.3x=1.78 @1.4x=1.65 @1.5x=1.54
->>> BEST: P5 @ 1.3x (eff=1.32) | Features: br=8%, ratio=44%, stall=23%
-
---- Benchmark 2: ALU-Intensive ---
-WARNING: cpu_morphable_top_tb.v:269: $readmemh(benches/bench_alu.hex): Not enough words in the file for the requested range [0:255].
-P3:  245 cyc | Eff: @1.0x=2.45 @1.1x=2.22
-WARNING: cpu_morphable_top_tb.v:269: $readmemh(benches/bench_alu.hex): Not enough words in the file for the requested range [0:255].
-P5:  261 cyc | Eff: @1.0x=2.61 @1.1x=2.37 @1.2x=2.17 @1.3x=2.00
-WARNING: cpu_morphable_top_tb.v:269: $readmemh(benches/bench_alu.hex): Not enough words in the file for the requested range [0:255].
-P7:  291 cyc | Eff: @1.0x=2.91 @1.1x=2.64 @1.2x=2.42 @1.3x=2.23 @1.4x=2.07 @1.5x=1.94
->>> BEST: P7 @ 1.5x (eff=1.94) | Features: br=6%, ratio=18%, stall=0%
-
---- Benchmark 3: Mixed (Bubble Sort) ---
-WARNING: cpu_morphable_top_tb.v:270: $readmemh(benches/bench_mixed.hex): Not enough words in the file for the requested range [0:255].
-P3: 15000 cyc | Eff: T/O T/O
-WARNING: cpu_morphable_top_tb.v:270: $readmemh(benches/bench_mixed.hex): Not enough words in the file for the requested range [0:255].
-P5:  400 cyc | Eff: @1.0x=4.00 @1.1x=3.63 @1.2x=3.33 @1.3x=3.07
-WARNING: cpu_morphable_top_tb.v:270: $readmemh(benches/bench_mixed.hex): Not enough words in the file for the requested range [0:255].
-P7:  506 cyc | Eff: @1.0x=5.06 @1.1x=4.60 @1.2x=4.21 @1.3x=3.89 @1.4x=3.61 @1.5x=3.37
->>> BEST: P5 @ 1.3x (eff=3.07) | Features: br=15%, ratio=100%, stall=7%
-
---- Benchmark 4: Compute-Intensive ---
-WARNING: cpu_morphable_top_tb.v:271: $readmemh(benches/bench_compute.hex): Not enough words in the file for the requested range [0:255].
-P3:  391 cyc | Eff: @1.0x=3.91 @1.1x=3.55
-WARNING: cpu_morphable_top_tb.v:271: $readmemh(benches/bench_compute.hex): Not enough words in the file for the requested range [0:255].
-P5:  412 cyc | Eff: @1.0x=4.12 @1.1x=3.74 @1.2x=3.43 @1.3x=3.16
-WARNING: cpu_morphable_top_tb.v:271: $readmemh(benches/bench_compute.hex): Not enough words in the file for the requested range [0:255].
-P7:  452 cyc | Eff: @1.0x=4.52 @1.1x=4.10 @1.2x=3.76 @1.3x=3.47 @1.4x=3.22 @1.5x=3.01
->>> BEST: P7 @ 1.5x (eff=3.01) | Features: br=5%, ratio=15%, stall=0%
-
---- Benchmark 5: Memory-Streaming ---
-WARNING: cpu_morphable_top_tb.v:272: $readmemh(benches/bench_stream.hex): Not enough words in the file for the requested range [0:255].
-P3:  589 cyc | Eff: @1.0x=5.89 @1.1x=5.35
-WARNING: cpu_morphable_top_tb.v:272: $readmemh(benches/bench_stream.hex): Not enough words in the file for the requested range [0:255].
-P5:  620 cyc | Eff: @1.0x=6.20 @1.1x=5.63 @1.2x=5.16 @1.3x=4.76
-WARNING: cpu_morphable_top_tb.v:272: $readmemh(benches/bench_stream.hex): Not enough words in the file for the requested range [0:255].
-P7:  680 cyc | Eff: @1.0x=6.80 @1.1x=6.18 @1.2x=5.66 @1.3x=5.23 @1.4x=4.85 @1.5x=4.53
->>> BEST: P7 @ 1.5x (eff=4.53) | Features: br=5%, ratio=15%, stall=0%
-
---- Benchmark 6: Tight-Loop ---
-WARNING: cpu_morphable_top_tb.v:273: $readmemh(benches/bench_tightloop.hex): Not enough words in the file for the requested range [0:255].
-P3:  603 cyc | Eff: @1.0x=6.03 @1.1x=5.48
-WARNING: cpu_morphable_top_tb.v:273: $readmemh(benches/bench_tightloop.hex): Not enough words in the file for the requested range [0:255].
-P5:  765 cyc | Eff: @1.0x=7.65 @1.1x=6.95 @1.2x=6.37 @1.3x=5.88
-WARNING: cpu_morphable_top_tb.v:273: $readmemh(benches/bench_tightloop.hex): Not enough words in the file for the requested range [0:255].
-P7: 1087 cyc | Eff: @1.0x=10.87 @1.1x=9.88 @1.2x=9.05 @1.3x=8.36 @1.4x=7.76 @1.5x=7.24
->>> BEST: P3 @ 1.1x (eff=5.48) | Features: br=35%, ratio=80%, stall=0%
-
---- Benchmark 7: Nested-Loops ---
-WARNING: cpu_morphable_top_tb.v:274: $readmemh(benches/bench_nested.hex): Not enough words in the file for the requested range [0:255].
-P3:  351 cyc | Eff: @1.0x=3.51 @1.1x=3.19
-WARNING: cpu_morphable_top_tb.v:274: $readmemh(benches/bench_nested.hex): Not enough words in the file for the requested range [0:255].
-P5:  412 cyc | Eff: @1.0x=4.12 @1.1x=3.74 @1.2x=3.43 @1.3x=3.16
-WARNING: cpu_morphable_top_tb.v:274: $readmemh(benches/bench_nested.hex): Not enough words in the file for the requested range [0:255].
-P7:  532 cyc | Eff: @1.0x=5.32 @1.1x=4.83 @1.2x=4.43 @1.3x=4.09 @1.4x=3.80 @1.5x=3.54
->>> BEST: P5 @ 1.3x (eff=3.16) | Features: br=22%, ratio=51%, stall=0%
-
---- Benchmark 8: Switch-Case ---
-WARNING: cpu_morphable_top_tb.v:275: $readmemh(benches/bench_switch.hex): Not enough words in the file for the requested range [0:255].
-P3:  542 cyc | Eff: @1.0x=5.42 @1.1x=4.92
-WARNING: cpu_morphable_top_tb.v:275: $readmemh(benches/bench_switch.hex): Not enough words in the file for the requested range [0:255].
-P5:  643 cyc | Eff: @1.0x=6.43 @1.1x=5.84 @1.2x=5.35 @1.3x=4.94
-WARNING: cpu_morphable_top_tb.v:275: $readmemh(benches/bench_switch.hex): Not enough words in the file for the requested range [0:255].
-P7:  843 cyc | Eff: @1.0x=8.43 @1.1x=7.66 @1.2x=7.02 @1.3x=6.48 @1.4x=6.02 @1.5x=5.62
->>> BEST: P3 @ 1.1x (eff=4.92) | Features: br=26%, ratio=55%, stall=0%
-
---- Benchmark 9: Vector-Ops ---
-WARNING: cpu_morphable_top_tb.v:276: $readmemh(benches/bench_vector.hex): Not enough words in the file for the requested range [0:255].
-P3:  306 cyc | Eff: @1.0x=3.06 @1.1x=2.78
-WARNING: cpu_morphable_top_tb.v:276: $readmemh(benches/bench_vector.hex): Not enough words in the file for the requested range [0:255].
-P5:  327 cyc | Eff: @1.0x=3.27 @1.1x=2.97 @1.2x=2.72 @1.3x=2.51
-WARNING: cpu_morphable_top_tb.v:276: $readmemh(benches/bench_vector.hex): Not enough words in the file for the requested range [0:255].
-P7:  367 cyc | Eff: @1.0x=3.67 @1.1x=3.33 @1.2x=3.05 @1.3x=2.82 @1.4x=2.62 @1.5x=2.44
->>> BEST: P7 @ 1.5x (eff=2.44) | Features: br=6%, ratio=19%, stall=0%
-
-================================================================
-PHASE 2: TRAIN HYBRID AI
-================================================================
-
-Epoch  1: 1 mode errors | Thresholds: P3_br>26, P7_br<10, P7_rat<25
-Epoch  2: 1 mode errors | Thresholds: P3_br>26, P7_br<10, P7_rat<25
-Epoch  3: 1 mode errors | Thresholds: P3_br>26, P7_br<10, P7_rat<25
-Epoch  4: 1 mode errors | Thresholds: P3_br>26, P7_br<10, P7_rat<25
-Epoch  5: 1 mode errors | Thresholds: P3_br>26, P7_br<10, P7_rat<25
-Epoch  6: 1 mode errors | Thresholds: P3_br>26, P7_br<10, P7_rat<25
-Epoch  7: 1 mode errors | Thresholds: P3_br>26, P7_br<10, P7_rat<25
-Epoch  8: 1 mode errors | Thresholds: P3_br>26, P7_br<10, P7_rat<25
-Epoch  9: 1 mode errors | Thresholds: P3_br>26, P7_br<10, P7_rat<25
-Epoch 10: 1 mode errors | Thresholds: P3_br>26, P7_br<10, P7_rat<25
-Epoch 11: 1 mode errors | Thresholds: P3_br>26, P7_br<10, P7_rat<25
-Epoch 12: 1 mode errors | Thresholds: P3_br>26, P7_br<10, P7_rat<25
-Epoch 13: 1 mode errors | Thresholds: P3_br>26, P7_br<10, P7_rat<25
-Epoch 14: 1 mode errors | Thresholds: P3_br>26, P7_br<10, P7_rat<25
-Epoch 15: 1 mode errors | Thresholds: P3_br>26, P7_br<10, P7_rat<25
-
-Final Learned Parameters:
-Mode: P3 if branch>26, P7 if branch<10 & ratio<25, else P5
-Clock: bias=175, w_branch=30, w_ratio=25, w_stall=20
-
-================================================================
-PHASE 3: FINAL PREDICTIONS
-================================================================
-
-Benchmark       | Features (Br/Rat/St) | Actual       | Predicted    | Mode?
-----------------|----------------------|--------------|--------------|------
-Branch-Heavy    | 30% / 72% /  0%      | P3 @ 1.1x    | P3 @ 1.1x    | YES
-Load-Use        |  8% / 44% / 23%      | P5 @ 1.3x    | P5 @ 1.3x    | YES
-ALU-Intensive   |  6% / 18% /  0%      | P7 @ 1.5x    | P7 @ 1.5x    | YES
-Mixed (Bubble)  | 15% / 100% /  7%      | P5 @ 1.3x    | P5 @ 1.3x    | YES
-Compute         |  5% / 15% /  0%      | P7 @ 1.5x    | P7 @ 1.5x    | YES
-Mem-Stream      |  5% / 15% /  0%      | P7 @ 1.5x    | P7 @ 1.5x    | YES
-Tight-Loop      | 35% / 80% /  0%      | P3 @ 1.1x    | P3 @ 1.1x    | YES
-Nested-Loops    | 22% / 51% /  0%      | P5 @ 1.3x    | P3 @ 1.1x    | no
-Switch-Case     | 26% / 55% /  0%      | P3 @ 1.1x    | P3 @ 1.1x    | YES
-Vector-Ops      |  6% / 19% /  0%      | P7 @ 1.5x    | P7 @ 1.5x    | YES
-
-================================================================
-MODE PREDICTION ACCURACY: 9/10 (90%)
-================================================================
-
-================================================================
-FINAL SUMMARY
-================================================================
-
-Optimal (Mode, Clock) for each benchmark:
-Benchmark       | Mode | Clock | Cycles | Eff.Time | Speedup
-----------------|------|-------|--------|----------|--------
-Branch-Heavy    | P3  | 1.1x  |   163  |     1.48 | 1.10x
-Load-Use        | P5  | 1.3x  |   172  |     1.32 | 1.21x
-ALU-Intensive   | P7  | 1.5x  |   291  |     1.94 | 1.26x
-Mixed (Bubble)  | P5  | 1.3x  |   400  |     3.07 | N/A
-Compute         | P7  | 1.5x  |   452  |     3.01 | 1.29x
-Mem-Stream      | P7  | 1.5x  |   680  |     4.53 | 1.30x
-Tight-Loop      | P3  | 1.1x  |   603  |     5.48 | 1.10x
-Nested-Loops    | P5  | 1.3x  |   412  |     3.16 | 1.11x
-Switch-Case     | P3  | 1.1x  |   542  |     4.92 | 1.10x
-Vector-Ops      | P7  | 1.5x  |   367  |     2.44 | 1.25x
-
-Win Count:
-P3: 3 wins | P5: 3 wins | P7: 4 wins
-
-================================================================
-AI Predictor Output:
-
-Given: branch%, CPI_ratio%, stall%
-Output: (Mode, Clock) where clock is CHOSEN within mode's range
-
-Example: branch=6%, ratio=19%, stall=0%
--> Mode=P7 (low branch, low ratio)
--> Clock=1.5x (high score, max allowed for P7)
-
-Example: branch=35%, ratio=80%, stall=0%
--> Mode=P3 (high branch)
--> Clock=1.1x (max allowed for P3)
-================================================================
-cpu_morphable_top_tb.v:580: $finish called at 281365000 (1ps)
-gtkwave --rcvar "splash_disable on" --rcvar "do_initial_zoom_fit 1" cpu_morphable_top_tb.vcd cpu_morphable_top_tb.gtkw
-WM Destroy
-GTKWave Analyzer v3.3.100 (w)1999-2019 BSI
-RCVAR   | 'splash_disable on' FOUND
-RCVAR   | 'do_initial_zoom_fit 1' FOUND
-[0] start time.
-[281365000] end time.
-** WARNING: Error opening save file 'cpu_morphable_top_tb.gtkw', skipping.
-=========================================================== [SUCCESS] Took 7.10 seconds ===========================================================
