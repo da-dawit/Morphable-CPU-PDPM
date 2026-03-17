@@ -561,7 +561,7 @@ def plot_summary_table(all_results, gen_results, outdir):
              'UCB1 (12-arm)', 'Joint Perceptron', 'Joint Perceptron + Phase', 'Full Oracle']
     order = [p for p in order if p in all_pols]
     
-    fig, ax = plt.subplots(1, 1, figsize=(4.5, 2.5))
+    fig, ax = plt.subplots(1, 1, figsize=(6.5, 2.8))
     ax.axis('off')
     
     cells = []
@@ -572,7 +572,7 @@ def plot_summary_table(all_results, gen_results, outdir):
                 t = all_results[w][pname]['total']
                 ot = all_results[w]['Full Oracle']['total']
                 oh = (t / ot - 1) * 100
-                row.append(f'{oh:.1f}%')
+                row.append(f'{oh:.3f}%')
             else: row.append('-')
         cells.append(row)
     
@@ -615,11 +615,11 @@ def plot_generalization(gen_results, outdir):
     ax.set_xticks(x)
     ax.set_xticklabels([n.replace(' ', '\n') for n in names], fontsize=5.5, ha='center')
     ax.set_ylabel('Overhead vs. Full Oracle (%)')
-    ax.set_title('Generalization: Train on 30, Test on 70 Unseen', fontsize=9)
+    ax.set_title('Generalization: Train on 30, Test on 78 Unseen', fontsize=9)
     
     for bar, c in zip(bars, corrects):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
-                f'{c:.0f}%', ha='center', va='bottom', fontsize=6)
+                f'{c:.3f}%', ha='center', va='bottom', fontsize=6)
     
     ax.grid(True, alpha=0.3, axis='y')
     plt.tight_layout()
@@ -747,6 +747,131 @@ def print_results(all_results, gen_results, eff12, feature_db):
 # 9. MAIN
 # ============================================================
 
+def plot_hyperparam_search(eff12, feature_db, outdir):
+    """Generate hyperparameter sensitivity figures for the paper."""
+    valid = sorted([b for b in eff12 if len(eff12[b]) >= 6])
+    train = valid[:30]; test = valid[30:]
+
+    # --- Heatmap: lr x passes -> accuracy ---
+    lr_range = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0]
+    pass_range = [5, 10, 15, 20, 25, 30]
+    heat = np.zeros((len(lr_range), len(pass_range)))
+
+    for i, lr in enumerate(lr_range):
+        for j, n_p in enumerate(pass_range):
+            perc = JointPerceptron(lr=lr)
+            perc.reset()
+            simulate(perc, make_workload(train, 1000, n_p), eff12, feature_db, interval=200)
+            frozen = JointPerceptron(lr=0.0)
+            frozen.reset()
+            frozen.weights = perc.weights.copy()
+            frozen._tried = [True] * N_CONFIGS
+            hist, total, ot = simulate(frozen, make_workload(test, 1000, 1), eff12, feature_db, interval=200)
+            acc = sum(1 for r in hist if r['correct_full']) / len(hist) * 100
+            heat[i, j] = acc
+
+    fig, ax = plt.subplots(1, 1, figsize=(5, 3.5))
+    im = ax.imshow(heat, aspect='auto', cmap='RdYlGn', vmin=60, vmax=100, origin='lower')
+    ax.set_xticks(range(len(pass_range)))
+    ax.set_xticklabels(pass_range)
+    ax.set_yticks(range(len(lr_range)))
+    ax.set_yticklabels([f'{l:.2f}' for l in lr_range])
+    ax.set_xlabel('Training Passes', fontsize=10)
+    ax.set_ylabel('Learning Rate (η)', fontsize=10)
+    for i in range(len(lr_range)):
+        for j in range(len(pass_range)):
+            val = heat[i, j]
+            color = 'white' if val < 75 else 'black'
+            ax.text(j, i, f'{val:.0f}', ha='center', va='center', fontsize=7, color=color, fontweight='bold')
+    best_i = lr_range.index(0.5)
+    best_j = pass_range.index(20)
+    ax.plot(best_j, best_i, 'r*', markersize=15, markeredgecolor='black', markeredgewidth=0.8)
+    plt.colorbar(im, ax=ax, label='Config Accuracy (%)', shrink=0.85)
+    plt.title('Hyperparameter Search: Accuracy on 78 Unseen Benchmarks', fontsize=10)
+    plt.tight_layout()
+    fig.savefig(os.path.join(outdir, 'hyperparam_heatmap.png'))
+    fig.savefig(os.path.join(outdir, 'hyperparam_heatmap.pdf'))
+    plt.close(fig)
+
+    # --- Line plot: lr sensitivity ---
+    lrs = [0.01, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 1.0]
+    accs = []; overheads = []
+    for lr in lrs:
+        perc = JointPerceptron(lr=lr)
+        perc.reset()
+        simulate(perc, make_workload(train, 1000, 20), eff12, feature_db, interval=200)
+        frozen = JointPerceptron(lr=0.0)
+        frozen.reset()
+        frozen.weights = perc.weights.copy()
+        frozen._tried = [True] * N_CONFIGS
+        hist, total, ot = simulate(frozen, make_workload(test, 1000, 1), eff12, feature_db, interval=200)
+        accs.append(sum(1 for r in hist if r['correct_full']) / len(hist) * 100)
+        overheads.append((total / ot - 1) * 100)
+
+    fig, ax1 = plt.subplots(1, 1, figsize=(5, 3.2))
+    c_acc, c_oh = '#2563eb', '#dc2626'
+    ax1.plot(lrs, accs, 'o-', color=c_acc, linewidth=2, markersize=5, label='Config Accuracy (%)')
+    ax1.set_xlabel('Learning Rate (η)', fontsize=10)
+    ax1.set_ylabel('Configuration Accuracy (%)', color=c_acc, fontsize=10)
+    ax1.tick_params(axis='y', labelcolor=c_acc)
+    ax1.set_ylim([60, 100])
+    ax1.axhline(y=93, color=c_acc, linestyle=':', alpha=0.4, linewidth=0.8)
+    ax2 = ax1.twinx()
+    ax2.plot(lrs, overheads, 's--', color=c_oh, linewidth=1.5, markersize=4, label='Overhead (%)')
+    ax2.set_ylabel('Overhead vs Oracle (%)', color=c_oh, fontsize=10)
+    ax2.tick_params(axis='y', labelcolor=c_oh)
+    ax2.set_ylim([-0.1, 2.0])
+    best_idx = accs.index(max(accs))
+    ax1.annotate(f'η={lrs[best_idx]}\n{accs[best_idx]:.1f}%',
+                 xy=(lrs[best_idx], accs[best_idx]),
+                 xytext=(lrs[best_idx]-0.15, accs[best_idx]-8),
+                 fontsize=8, fontweight='bold', color=c_acc,
+                 arrowprops=dict(arrowstyle='->', color=c_acc, lw=1.2))
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1+lines2, labels1+labels2, loc='lower right', fontsize=8)
+    plt.title('Generalization Accuracy vs Learning Rate\n(train 30, test 78 unseen, 20 passes)', fontsize=10)
+    plt.tight_layout()
+    fig.savefig(os.path.join(outdir, 'lr_sensitivity.png'))
+    fig.savefig(os.path.join(outdir, 'lr_sensitivity.pdf'))
+    plt.close(fig)
+
+    # --- Line plot: training convergence ---
+    passes_list = list(range(1, 31))
+    accs_pass = []
+    for n_p in passes_list:
+        perc = JointPerceptron(lr=0.5)
+        perc.reset()
+        simulate(perc, make_workload(train, 1000, n_p), eff12, feature_db, interval=200)
+        frozen = JointPerceptron(lr=0.0)
+        frozen.reset()
+        frozen.weights = perc.weights.copy()
+        frozen._tried = [True] * N_CONFIGS
+        hist, total, ot = simulate(frozen, make_workload(test, 1000, 1), eff12, feature_db, interval=200)
+        accs_pass.append(sum(1 for r in hist if r['correct_full']) / len(hist) * 100)
+
+    fig, ax1 = plt.subplots(1, 1, figsize=(5, 3.2))
+    ax1.plot(passes_list, accs_pass, 'o-', color=c_acc, linewidth=2, markersize=3)
+    ax1.set_xlabel('Training Passes over 30 Benchmarks', fontsize=10)
+    ax1.set_ylabel('Configuration Accuracy (%)', fontsize=10)
+    ax1.set_ylim([60, 100])
+    ax1.axhline(y=93, color=c_acc, linestyle=':', alpha=0.4, linewidth=0.8)
+    for i, a in enumerate(accs_pass):
+        if a >= 97:
+            ax1.axvline(x=passes_list[i], color='green', linestyle='--', alpha=0.5, linewidth=1)
+            ax1.annotate(f'Converged\n({passes_list[i]} passes, {a:.1f}%)',
+                         xy=(passes_list[i], a), xytext=(passes_list[i]+4, a-8),
+                         fontsize=8, fontweight='bold', color='green',
+                         arrowprops=dict(arrowstyle='->', color='green', lw=1))
+            break
+    plt.title('Training Convergence (η=0.5, train 30, test 78 unseen)', fontsize=10)
+    plt.tight_layout()
+    fig.savefig(os.path.join(outdir, 'training_convergence.png'))
+    fig.savefig(os.path.join(outdir, 'training_convergence.pdf'))
+    plt.close(fig)
+    print("  Hyperparameter figures saved.")
+
+
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     trace_path = os.path.join(script_dir, 'trace_log.csv')
@@ -778,6 +903,7 @@ def main():
     plot_generalization(gen_results, outdir)
     plot_weights(eff12, feature_db, outdir)
     plot_config_distribution(all_results, eff12, outdir)
+    plot_hyperparam_search(eff12, feature_db, outdir)
     
     print_results(all_results, gen_results, eff12, feature_db)
     
